@@ -215,17 +215,13 @@ SOURCE_ARCHIVE_FILES = (
     ".env.example",
     "Start Bot.bat",
     "Stop Bot.bat",
-    "Setup Autostart.bat",
-    "watch_telegram.ps1",
     "Start Explorer.bat",
     "Build Explorer EXE.bat",
     "TelegramFileExplorer.spec",
     "TelegramFileBot.spec",
     "TelegramFileExplorer.exe",
     "TelegramFileBot.exe",
-    "deploy/install.sh",
     "desktop/__init__.py",
-    "desktop/app.py",
     "desktop/appconfig.py",
     "desktop/applock.py",
     "desktop/botsup.py",
@@ -277,12 +273,7 @@ RESTORE_TEXT = """Telegram File Bot — restore this archive
    the Explorer also runs the bot. If they are missing or you want to rebuild
    from source, run "Build Explorer EXE.bat" (needs PyInstaller).
 
-   Linux (Ubuntu/Debian server):
-   bash deploy/install.sh
-   This installs the dependencies and runs the bot as a systemd service
-   that starts on boot and restarts after crashes.
-
-Full setup, autostart and vault instructions are in README.md.
+Full setup and vault instructions are in README.md.
 
 This archive contains a snapshot of data/files.db. It does NOT contain .env,
 your bot token, the virtual environment, logs or backup snapshots. It also

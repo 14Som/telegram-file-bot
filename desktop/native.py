@@ -1,8 +1,7 @@
 """Standalone app window: local server plus an embedded WebView2 control.
 
-This is the launcher used by the packaged TelegramFileExplorer.exe. Unlike
-app.py, it never starts the Edge browser; the UI runs inside the app's own
-window.
+This is the launcher used by the packaged TelegramFileExplorer.exe. The UI runs
+inside the app's own window; no browser is started.
 """
 
 from __future__ import annotations
