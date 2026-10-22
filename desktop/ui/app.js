@@ -3386,20 +3386,25 @@ function startUpload(input) {
   }
   const total = entries.reduce((sum, entry) => sum + entry.file.size, 0);
   const folder = S.folder || "";
+  const client = `c${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   const form = new FormData();
   form.append("paths", JSON.stringify(entries.map((entry) => entry.rel)));
+  form.append("client", client);
   for (const entry of entries) form.append("files", entry.file, entry.file.name);
   if (folder) form.append("folder", folder);
+  const xhr = new XMLHttpRequest();
   S.localUpload = {
     name: uploadRootLabel(entries),
     size: total,
     sent: 0,
-    state: "sending"
+    state: "sending",
+    client,
+    canceled: false,
+    xhr
   };
   $("uploadBtn").disabled = true;
   renderUploads();
   showUploadPanel();
-  const xhr = new XMLHttpRequest();
   xhr.open("POST", "/api/upload");
   xhr.setRequestHeader("X-TFE", "1");
   xhr.withCredentials = true;
@@ -3409,8 +3414,10 @@ function startUpload(input) {
     renderUploads();
   };
   xhr.onload = async () => {
+    const local = S.localUpload;
     S.localUpload = null;
     $("uploadBtn").disabled = !ready();
+    if (local && local.canceled) { renderUploads(); return; }
     let data = null;
     try { data = JSON.parse(xhr.responseText || "{}"); } catch (_) { data = {}; }
     if (xhr.status >= 200 && xhr.status < 300) {
@@ -3426,12 +3433,46 @@ function startUpload(input) {
     }
   };
   xhr.onerror = () => {
+    const local = S.localUpload;
     S.localUpload = null;
     $("uploadBtn").disabled = !ready();
-    toast("The upload could not reach the local app.", "error");
+    if (!local || !local.canceled) {
+      toast("The upload could not reach the local app.", "error");
+    }
     renderUploads();
   };
   xhr.send(form);
+}
+function cancelLocalUpload() {
+  const local = S.localUpload;
+  if (!local) return;
+  local.canceled = true;
+  S.localUpload = null;
+  try { local.xhr.abort(); } catch (_) { /* request already finished */ }
+  $("uploadBtn").disabled = !ready();
+  renderUploads();
+  setStatus("Upload cancelled");
+  toast("Upload cancelled.", "success", 3000);
+  // The app may have accepted the body just before the abort landed; make
+  // sure any transfers it queued for this batch are cancelled too.
+  api("/api/transfers/cancel", { method: "POST", body: { client: local.client } })
+    .then(() => fetchTransfers(false))
+    .catch(() => {});
+}
+async function cancelTransfer(id) {
+  try {
+    await api(`/api/transfers/${encodeURIComponent(id)}/cancel`, { method: "POST" });
+    toast("Cancelling…", "success", 2500);
+    await fetchTransfers(false);
+    startTransferPolling();
+  } catch (error) {
+    if (error && error.status === 404) {
+      toast("That transfer already finished.", "info", 3000);
+      await fetchTransfers(false);
+      return;
+    }
+    toast(error.message || "The transfer could not be cancelled.", "error");
+  }
 }
 function showUploadPanel() {
   $("uploadPanel").hidden = false;
@@ -3447,10 +3488,14 @@ function renderUploads() {
   if (S.localUpload) {
     const local = S.localUpload;
     const pct = local.size ? Math.min(100, Math.round((local.sent / local.size) * 100)) : 0;
+    const sub = h("div", { class: "upload-sub" }, "Sending to the app… ");
+    const cancel = h("button", { class: "link-btn", type: "button", text: "Cancel" });
+    cancel.addEventListener("click", cancelLocalUpload);
+    sub.append(cancel);
     rows.push(h("div", { class: "upload-row" },
       h("div", { class: "upload-line" }, h("span", { class: "upload-name", text: local.name, title: local.name }), h("span", { class: "upload-pct", text: `${pct}%` })),
       h("div", { class: "upload-track" }, h("i", { style: `width:${pct}%` })),
-      h("div", { class: "upload-sub", text: "Sending to the app…" })
+      sub
     ));
   }
   for (const transfer of S.transfers) {
@@ -3461,6 +3506,7 @@ function renderUploads() {
       : transfer.size ? Math.min(100, Math.round(((transfer.sent || 0) / transfer.size) * 100)) : active ? 0 : 100;
     let sub;
     if (state === "error") sub = transfer.error;
+    else if (state === "cancelled") sub = "Cancelled";
     else if (state === "done") sub = transfer.parts ? `Done · ${transfer.parts} parts uploaded` : "Done";
     else if (state === "queued") sub = "Queued";
     else if (state === "splitting") sub = "Splitting into archive parts…";
@@ -3475,8 +3521,14 @@ function renderUploads() {
       save.addEventListener("click", () => downloadItem({ download_url: transfer.result_url }));
       subLine.append(" ", save);
     }
+    if (active) {
+      const cancel = h("button", { class: "link-btn", type: "button", text: "Cancel" });
+      cancel.addEventListener("click", () => cancelTransfer(transfer.id));
+      subLine.append(" ", cancel);
+    }
+    const pctText = state === "error" ? "!" : state === "cancelled" ? "—" : `${pct}%`;
     rows.push(h("div", { class: `upload-row ${state}` },
-      h("div", { class: "upload-line" }, h("span", { class: "upload-name", text: transfer.name, title: transfer.name }), h("span", { class: "upload-pct", text: transfer.state === "error" ? "!" : `${pct}%` })),
+      h("div", { class: "upload-line" }, h("span", { class: "upload-name", text: transfer.name, title: transfer.name }), h("span", { class: "upload-pct", text: pctText })),
       h("div", { class: "upload-track" }, h("i", { style: `width:${pct}%` })),
       subLine
     ));
@@ -3500,6 +3552,7 @@ async function pollTransfers() {
     let newlyDone = 0;
     let newlyFailed = 0;
     let newlyReady = 0;
+    let newlyCancelled = 0;
     for (const transfer of transfers) {
       if (transfer.state === "done" && !S.seenTransfers.has(transfer.id)) {
         S.seenTransfers.add(transfer.id);
@@ -3514,6 +3567,10 @@ async function pollTransfers() {
         S.seenTransfers.add(`r:${transfer.id}`);
         newlyReady += 1;
       }
+      if (transfer.state === "cancelled" && !S.seenTransfers.has(`c:${transfer.id}`)) {
+        S.seenTransfers.add(`c:${transfer.id}`);
+        newlyCancelled += 1;
+      }
     }
     S.transfers = transfers;
     renderUploads();
@@ -3525,6 +3582,12 @@ async function pollTransfers() {
     if (newlyReady) {
       toast(`Complete file ready — click Save file in the transfers list.`, "success", 7000);
       setStatus("Merged file ready");
+    }
+    if (newlyCancelled) {
+      // A split upload may have already sent parts; the app removes them
+      // when it processes the cancel, so refresh the library.
+      await Promise.all([loadNav(), loadItems({ reset: true })]);
+      setStatus("Upload cancelled");
     }
     if (!active.length && !S.localUpload) {
       clearInterval(S.transferTimer);

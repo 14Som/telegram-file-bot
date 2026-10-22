@@ -15,7 +15,7 @@ import shutil
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 
 import segno
 from telethon import TelegramClient, errors, types, utils
@@ -71,6 +71,10 @@ _LABELS = {
 
 class TGError(Exception):
     """An error that is safe and useful to show in the UI."""
+
+
+class TransferCancelled(TGError):
+    """Raised inside a transfer when the user cancels it."""
 
 
 def friendly_error(exc: Exception) -> str:
@@ -179,6 +183,7 @@ class TelegramService:
             "finished": None,
         }
         self.transfers: Dict[str, Dict[str, Any]] = {}
+        self.cancelled_clients: Set[str] = set()
         self._thumb_locks: Dict[int, asyncio.Lock] = {}
         self._thumb_sem: Optional[asyncio.Semaphore] = None
         self._message_cache: Dict[int, Tuple[float, Any]] = {}
@@ -900,20 +905,47 @@ class TelegramService:
             raise TGError(friendly_error(exc))
 
     # ----------------------------------------------------------------- upload
-    def new_transfer(self, name: str, size: int) -> str:
+    def new_transfer(self, name: str, size: int, client: str = "") -> str:
         transfer_id = f"t{int(time.time() * 1000)}-{len(self.transfers)}"
+        cancelled = bool(client) and client in self.cancelled_clients
         self.transfers[transfer_id] = {
             "id": transfer_id,
             "name": name,
             "size": size,
             "sent": 0,
-            "state": "queued",
+            "state": "cancelled" if cancelled else "queued",
             "error": None,
             "item_id": None,
+            "item_ids": [],
+            "client": client,
+            "cancel": cancelled,
             "started": datetime.now().isoformat(timespec="seconds"),
         }
         self._prune_transfers()
         return transfer_id
+
+    def cancel_transfer(self, transfer_id: str) -> bool:
+        transfer = self.transfers.get(transfer_id)
+        if transfer is None or transfer.get("cancel"):
+            return False
+        if transfer.get("state") in {"done", "error", "cancelled", "ready"}:
+            return False
+        transfer["cancel"] = True
+        transfer["state"] = "cancelled"
+        return True
+
+    def cancel_client(self, client: str) -> int:
+        client = str(client or "").strip()
+        if not client:
+            return 0
+        if len(self.cancelled_clients) > 500:
+            self.cancelled_clients.clear()
+        self.cancelled_clients.add(client)
+        return sum(
+            1
+            for transfer in list(self.transfers.values())
+            if transfer.get("client") == client and self.cancel_transfer(transfer["id"])
+        )
 
     def _prune_transfers(self) -> None:
         if len(self.transfers) <= 60:
@@ -940,13 +972,24 @@ class TelegramService:
         path = Path(entry["path"])
         folder = clean_folder_path(entry.get("folder") or "", "")
         transfer = self.transfers.get(transfer_id)
-        if transfer is None:
-            raise TGError("Upload was cancelled.")
+        if transfer is None or transfer.get("cancel"):
+            raise TransferCancelled()
         shared = bool(entry.get("shared"))
         sent_base = int(entry.get("sent_base") or 0)
         transfer["state"] = "uploading"
         # Telegram's photo pipeline recompresses JPEG/PNG; keep originals intact.
         keep_original = Path(name).suffix.lower() in {".png", ".jpg", ".jpeg"}
+
+        def report(sent: int, total: int) -> None:
+            # Telethon calls this between upload parts; raising aborts the upload.
+            if transfer.get("cancel"):
+                raise TransferCancelled()
+            self._progress(
+                transfer_id,
+                sent_base + sent,
+                None if shared else total,
+            )
+
         try:
             message = await client.send_file(
                 self._entity,
@@ -955,16 +998,22 @@ class TelegramService:
                 force_document=keep_original,
                 attributes=[DocumentAttributeFilename(name)],
                 supports_streaming=True,
-                progress_callback=lambda sent, total: self._progress(
-                    transfer_id,
-                    sent_base + sent,
-                    None if shared else total,
-                ),
+                progress_callback=report,
             )
+            if transfer.get("cancel"):
+                # The upload finished before the cancel landed; remove the
+                # message so a cancelled file never shows up in the channel.
+                try:
+                    await client.delete_messages(self._entity, [message.id])
+                except Exception:
+                    pass
+                raise TransferCancelled()
             info = self.describe(message, int(self._entity.id))
             if info is None:
                 raise TGError("Telegram stored the file but it could not be indexed.")
             item_id = catalog.upsert(info)
+            if shared:
+                transfer.setdefault("item_ids", []).append(int(item_id))
             if folder:
                 catalog.create_folder(folder)
                 catalog.update(item_id, folder=folder, folder_source="user")
@@ -984,6 +1033,9 @@ class TelegramService:
                 )
             return item or {}
         except Exception as exc:
+            if transfer.get("cancel") or isinstance(exc, TransferCancelled):
+                transfer.update(state="cancelled", error=None)
+                raise TransferCancelled() from exc
             message = friendly_error(exc)
             transfer.update(state="error", error=message)
             raise TGError(message)

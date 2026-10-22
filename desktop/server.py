@@ -38,7 +38,14 @@ from .catalog import (
     normalize_tags,
 )
 from .splitmerge import merge_parts, parse_part_name, split_file
-from .tg import MAX_UPLOAD, PART_SIZE, TGError, TelegramService, friendly_error
+from .tg import (
+    MAX_UPLOAD,
+    PART_SIZE,
+    TGError,
+    TelegramService,
+    TransferCancelled,
+    friendly_error,
+)
 
 log = logging.getLogger("tfe.server")
 
@@ -110,6 +117,10 @@ class ItemPatch(BaseModel):
 
 class MergeBody(BaseModel):
     item_id: int
+
+
+class TransferCancelBody(BaseModel):
+    client: str = ""
 
 
 class BatchIdsBody(BaseModel):
@@ -1295,6 +1306,7 @@ async def upload(
     files: List[UploadFile] = File(...),
     folder: str = Form(""),
     paths: str = Form("[]"),
+    client: str = Form(""),
 ):
     state = _state(request)
     info = state.service.status()
@@ -1310,6 +1322,7 @@ async def upload(
     if not isinstance(requested, list):
         requested = []
     base_folder = clean_folder_path(folder, "")
+    client_id = re.sub(r"[^a-z0-9-]", "", (client or "").lower())[:64]
     batch = uuid.uuid4().hex
     batch_dir = appconfig.CACHE_DIR / "uploads" / batch
     entries: List[Dict[str, Any]] = []
@@ -1352,7 +1365,7 @@ async def upload(
             if total == 0:
                 raise HTTPException(status_code=400, detail=f"{name} is empty.")
             label = join_folder(rel_dir, name) or name
-            transfer_id = state.service.new_transfer(label, total)
+            transfer_id = state.service.new_transfer(label, total, client=client_id)
             entries.append(
                 {
                     "path": str(target),
@@ -1375,6 +1388,24 @@ async def upload(
     }
 
 
+async def _discard_transfer_items(state: Any, transfer: Dict[str, Any]) -> None:
+    """Remove parts a split upload already sent before it was cancelled."""
+    ids = list(dict.fromkeys(int(value) for value in transfer.get("item_ids") or []))
+    transfer["item_ids"] = []
+    for item_id in ids:
+        item = await run_in_threadpool(state.catalog.get, item_id)
+        if item is None:
+            continue
+        try:
+            await state.service.delete_message(item["message_id"])
+        except TGError as exc:
+            log.warning("Could not remove cancelled part %s: %s", item_id, exc)
+            continue
+        await run_in_threadpool(state.catalog.delete, item_id)
+        if state.service.is_bot_vault():
+            Catalog.clear_bot_vault(state.bot_db, item["message_id"])
+
+
 async def _run_uploads(state: Any, entries: List[Dict[str, Any]]) -> None:
     for entry in entries:
         transfer = state.service.transfers.get(entry["transfer_id"])
@@ -1382,38 +1413,48 @@ async def _run_uploads(state: Any, entries: List[Dict[str, Any]]) -> None:
         try:
             if entry.get("split"):
                 if transfer is not None:
+                    if transfer.get("cancel"):
+                        raise TransferCancelled()
                     transfer.update(state="splitting", sent=0)
                 workdir = appconfig.CACHE_DIR / "uploads" / f"split-{uuid.uuid4().hex}"
                 try:
-                    volumes = await run_in_threadpool(
-                        split_file, original, workdir, PART_SIZE
-                    )
-                except Exception as exc:
+                    try:
+                        volumes = await run_in_threadpool(
+                            split_file, original, workdir, PART_SIZE
+                        )
+                    except Exception as exc:
+                        detail = str(exc) or "The file could not be split into parts."
+                        raise HTTPException(status_code=500, detail=detail) from exc
+                    if transfer is not None:
+                        transfer["parts"] = len(volumes)
+                    try:
+                        original.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    sent_base = 0
+                    last_index = len(volumes) - 1
+                    for index, volume in enumerate(volumes):
+                        if transfer is not None and transfer.get("cancel"):
+                            raise TransferCancelled()
+                        part_entry = {
+                            **entry,
+                            "path": str(volume),
+                            "name": volume.name,
+                            "sent_base": sent_base,
+                            "shared": True,
+                            "last": index == last_index,
+                        }
+                        sent_base += volume.stat().st_size
+                        await state.service.upload_one(part_entry, state.catalog)
+                finally:
                     shutil.rmtree(workdir, ignore_errors=True)
-                    detail = str(exc) or "The file could not be split into parts."
-                    raise HTTPException(status_code=500, detail=detail)
-                if transfer is not None:
-                    transfer["parts"] = len(volumes)
-                try:
-                    original.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                sent_base = 0
-                last_index = len(volumes) - 1
-                for index, volume in enumerate(volumes):
-                    part_entry = {
-                        **entry,
-                        "path": str(volume),
-                        "name": volume.name,
-                        "sent_base": sent_base,
-                        "shared": True,
-                        "last": index == last_index,
-                    }
-                    sent_base += volume.stat().st_size
-                    await state.service.upload_one(part_entry, state.catalog)
-                shutil.rmtree(workdir, ignore_errors=True)
             else:
                 await state.service.upload_one(entry, state.catalog)
+        except TransferCancelled:
+            if transfer is not None:
+                transfer.update(state="cancelled", error=None)
+                await _discard_transfer_items(state, transfer)
+            log.info("Upload cancelled for %s", entry["name"])
         except Exception as exc:
             message = friendly_error(exc) if not isinstance(exc, HTTPException) else exc.detail
             if transfer is not None:
@@ -1435,6 +1476,20 @@ async def _run_uploads(state: Any, entries: List[Dict[str, Any]]) -> None:
 async def transfers(request: Request):
     state = _state(request)
     return {"transfers": list(state.service.transfers.values())[-80:]}
+
+
+@app.post("/api/transfers/cancel")
+async def cancel_client_transfers(body: TransferCancelBody, request: Request):
+    state = _state(request)
+    return {"cancelled": state.service.cancel_client(body.client)}
+
+
+@app.post("/api/transfers/{transfer_id}/cancel")
+async def cancel_transfer(transfer_id: str, request: Request):
+    state = _state(request)
+    if not state.service.cancel_transfer(transfer_id):
+        raise HTTPException(status_code=404, detail="This transfer already finished.")
+    return {"ok": True}
 
 
 # ------------------------------------------------------------------ merge
@@ -1493,6 +1548,8 @@ async def _run_merge(state: Any, job: Dict[str, Any]) -> None:
         downloaded: List[Path] = []
         for index, part_item in enumerate(job["items"], start=1):
             if transfer is not None:
+                if transfer.get("cancel"):
+                    raise TransferCancelled()
                 transfer["state"] = "downloading"
             message, size, _mime = await state.service.media_info(part_item)
             target = parts_dir / clean_name(
@@ -1502,13 +1559,19 @@ async def _run_merge(state: Any, job: Dict[str, Any]) -> None:
                 async for chunk in state.service.stream_chunks(message, 0, size):
                     if QUIT.is_set():
                         raise TGError("The app is shutting down.")
+                    if transfer is not None and transfer.get("cancel"):
+                        raise TransferCancelled()
                     handle.write(chunk)
                     if transfer is not None:
                         transfer["sent"] = int(transfer.get("sent") or 0) + len(chunk)
             downloaded.append(target)
         if transfer is not None:
+            if transfer.get("cancel"):
+                raise TransferCancelled()
             transfer["state"] = "merging"
         final, final_name = await run_in_threadpool(merge_parts, downloaded, job["dir"])
+        if transfer is not None and transfer.get("cancel"):
+            raise TransferCancelled()
         job["path"] = str(final)
         job["name"] = final_name
         if transfer is not None:
@@ -1519,6 +1582,12 @@ async def _run_merge(state: Any, job: Dict[str, Any]) -> None:
                 result_name=final_name,
                 error=None,
             )
+    except TransferCancelled:
+        if transfer is not None:
+            transfer.update(state="cancelled", error=None)
+        log.info("Merge cancelled for %s", job.get("name"))
+        state.merge_jobs.pop(job["id"], None)
+        shutil.rmtree(job["dir"], ignore_errors=True)
     except Exception as exc:
         if isinstance(exc, HTTPException):
             message = str(exc.detail)

@@ -31,9 +31,10 @@ launch — folders, names, tags, notes, favorites, thumbnails and settings.
 - **Search & filters** — text, tag, type, size, date, notes-only; six sort orders
 - **Previews** — images, video, audio, PDF and text inline; downloads keep the
   original filename
-- **Uploads** — drag & drop files or whole folder trees with per-file progress.
-  Anything above Telegram's 2 GB limit (4 GB with Premium) is split into parts
-  automatically and rejoined with one click, up to 64 GB
+- **Uploads** — drag & drop files or whole folder trees with per-file progress;
+  cancel a running upload from the Uploads panel. Anything above Telegram's
+  2 GB limit (4 GB with Premium) is split into parts automatically and rejoined
+  with one click, up to 64 GB
 - **Bulk actions** — Ctrl-click, Shift-click or Ctrl+A, then Download ZIP, Favorite,
   Move, Copy links or Delete (up to 300 files at once)
 - **Themes** — System, Light, Dark, Mica, Acrylic
